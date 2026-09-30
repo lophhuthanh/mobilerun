@@ -33,20 +33,17 @@ jobs:
 
       # BẬT REMOTE DESKTOP + ĐẶT MẬT KHẨU
       - name: 🖥️ BẬT REMOTE DESKTOP
+        env:
+          CUSTOM_RDP_PASS: ${{ secrets.CUSTOM_RDP_PASS }}
         run: |
-          function New-PremiumPassword {
-            $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
-            $lower = 'abcdefghijkmnpqrstuvwxyz'
-            $numbers = '23456789'
-            $all = $upper + $lower + $numbers
-            $pw = $upper[(Get-Random -Maximum $upper.Length)] + $lower[(Get-Random -Maximum $lower.Length)] + $numbers[(Get-Random -Maximum $numbers.Length)]
-            for ($i = 1; $i -le 9; $i++) { $pw += $all[(Get-Random -Maximum $all.Length)] }
-            return -join ($pw.ToCharArray() | Sort-Object { Get-Random })
-          }
-
-          # Tài khoản đăng nhập RDP
+          $ErrorActionPreference = "Stop"
+          # Mật khẩu chỉ lấy từ GitHub Actions Secrets, không sinh hoặc in ra log.
           $rdpUser = "runneradmin"
-          $rdpPass = if ($env:CUSTOM_RDP_PASS) { $env:CUSTOM_RDP_PASS } else { New-PremiumPassword }
+          $rdpPass = $env:CUSTOM_RDP_PASS
+          if ([string]::IsNullOrWhiteSpace($rdpPass)) {
+            throw "Thiếu Secret CUSTOM_RDP_PASS. Thêm tại Settings > Secrets and variables > Actions trước khi chạy."
+          }
+          Write-Output "::add-mask::$rdpPass"
 
           Write-Host "🔐 Đang đặt mật khẩu cho $rdpUser..." -ForegroundColor Yellow
           $securePass = ConvertTo-SecureString $rdpPass -AsPlainText -Force
@@ -67,7 +64,6 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser -ErrorAction SilentlyContinue
 
           echo "RDP_USER=$rdpUser" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$rdpPass" >> $env:GITHUB_ENV
           Write-Host "✅ Remote Desktop đã bật | User: $rdpUser" -ForegroundColor Green
 
       # CÀI TUNNEL BORE (NAT cổng 3389 ra public)
@@ -131,14 +127,14 @@ jobs:
           Write-Host "├───────────────────────────────────────────┤" -ForegroundColor Cyan
           Write-Output "│ 🌐  Địa chỉ: ${env:BORE_HOST}:${env:BORE_PORT}"
           Write-Output "│ 👤  Tài khoản: $env:RDP_USER"
-          Write-Output "│ 🔐  Mật khẩu: $env:RDP_PASS"
+          Write-Output "│ 🔐  Mật khẩu: dùng giá trị bạn đã đặt trong Secret CUSTOM_RDP_PASS"
           Write-Output "│ ⏰  Thời lượng: $displayTime"
           Write-Output "│ 🕐  Kết thúc: $($thoiGianKetThuc.ToString('HH:mm:ss'))"
           Write-Host "├───────────────────────────────────────────┤" -ForegroundColor Cyan
           Write-Output "│ 💡 Cách kết nối:"
           Write-Output "│   1. Mở Remote Desktop (mstsc trên Windows)"
           Write-Output "│   2. Computer: ${env:BORE_HOST}:${env:BORE_PORT}"
-          Write-Output "│   3. User + Password như trên"
+          Write-Output "│   3. User như trên; Password là Secret CUSTOM_RDP_PASS"
           Write-Host "└───────────────────────────────────────────┘" -ForegroundColor Cyan
           echo "TOTAL_MINUTES=$totalMinutes" >> $env:GITHUB_ENV
 
