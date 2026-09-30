@@ -1,4 +1,4 @@
-name: kiểm tra trực tiếp
+name: kiểm tra trực tiếp (RDP + bore)
 on:
   workflow_dispatch:
     inputs:
@@ -12,7 +12,7 @@ on:
           - '5h'
           - '5h40m'
 jobs:
-  Premium-RustDesk-Setup:
+  Premium-RDP-Setup:
     runs-on: windows-latest
     timeout-minutes: 340
     steps:
@@ -20,7 +20,7 @@ jobs:
       - name: 🎯 KHỞI ĐỘNG HỆ THỐNG
         run: |
           Write-Host ""
-          Write-Host "🤖 AI STV PREMIUM RUSTDESK SERVER" -ForegroundColor Yellow
+          Write-Host "🤖 AI STV PREMIUM RDP SERVER" -ForegroundColor Yellow
           Write-Host "⚡ Powered by AI STV" -ForegroundColor Green
           Write-Host "🕒 Thời gian: ${{ github.event.inputs.duration }}" -ForegroundColor Magenta
           Write-Host ""
@@ -31,8 +31,8 @@ jobs:
           }
           Write-Host "`r✅ Hệ thống đã sẵn sàng!" -ForegroundColor Green
 
-      # CÀI ĐẶT RUSTDESK
-      - name: 📥 CÀI ĐẶT RUSTDESK
+      # BẬT REMOTE DESKTOP + ĐẶT MẬT KHẨU
+      - name: 🖥️ BẬT REMOTE DESKTOP
         run: |
           function New-PremiumPassword {
             $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
@@ -40,99 +40,112 @@ jobs:
             $numbers = '23456789'
             $all = $upper + $lower + $numbers
             $pw = $upper[(Get-Random -Maximum $upper.Length)] + $lower[(Get-Random -Maximum $lower.Length)] + $numbers[(Get-Random -Maximum $numbers.Length)]
-            for ($i = 1; $i -le 5; $i++) { $pw += $all[(Get-Random -Maximum $all.Length)] }
+            for ($i = 1; $i -le 9; $i++) { $pw += $all[(Get-Random -Maximum $all.Length)] }
             return -join ($pw.ToCharArray() | Sort-Object { Get-Random })
           }
 
-          $installDir = "$env:ProgramFiles\RustDesk"
-          $rdExe = "$installDir\rustdesk.exe"
+          # Tài khoản đăng nhập RDP
+          $rdpUser = "runneradmin"
+          $rdpPass = if ($env:CUSTOM_RDP_PASS) { $env:CUSTOM_RDP_PASS } else { New-PremiumPassword }
 
-          Write-Host "📥 Đang tải RustDesk..." -ForegroundColor Yellow
-          Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/1.4.9/rustdesk-1.4.9-x86_64.exe" -OutFile "$env:TEMP\rustdesk.exe" -UseBasicParsing
+          Write-Host "🔐 Đang đặt mật khẩu cho $rdpUser..." -ForegroundColor Yellow
+          $securePass = ConvertTo-SecureString $rdpPass -AsPlainText -Force
+          Set-LocalUser -Name $rdpUser -Password $securePass
+          # Không cho mật khẩu hết hạn trong phiên
+          Set-LocalUser -Name $rdpUser -PasswordNeverExpires $true -ErrorAction SilentlyContinue
 
-          Write-Host "⚙️  Đang cài đặt RustDesk (silent)..." -ForegroundColor Yellow
-          Start-Process "$env:TEMP\rustdesk.exe" -ArgumentList "--silent-install"
-          Start-Sleep -Seconds 30
+          Write-Host "⚙️  Đang bật Remote Desktop..." -ForegroundColor Yellow
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          # Bật Network Level Authentication cho bảo mật
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-          if (-not (Test-Path $rdExe)) {
-            Write-Host "❌ Không thấy rustdesk.exe sau khi cài tại $rdExe" -ForegroundColor Red
+          Write-Host "🔧 Đang mở firewall cho Remote Desktop..." -ForegroundColor Yellow
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Allow RDP 3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
+          # Đảm bảo user thuộc nhóm Remote Desktop Users
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser -ErrorAction SilentlyContinue
+
+          echo "RDP_USER=$rdpUser" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$rdpPass" >> $env:GITHUB_ENV
+          Write-Host "✅ Remote Desktop đã bật | User: $rdpUser" -ForegroundColor Green
+
+      # CÀI TUNNEL BORE (NAT cổng 3389 ra public)
+      - name: 🌐 TẠO TUNNEL BORE
+        run: |
+          $boreVersion = "v0.6.0"
+          $boreZip = "$env:TEMP\bore.zip"
+          $boreDir = "$env:TEMP\bore"
+
+          Write-Host "📥 Đang tải bore $boreVersion..." -ForegroundColor Yellow
+          $url = "https://github.com/ekzhang/bore/releases/download/$boreVersion/bore-$boreVersion-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile $boreZip -UseBasicParsing
+          Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
+          $boreExe = (Get-ChildItem -Path $boreDir -Filter "bore.exe" -Recurse | Select-Object -First 1).FullName
+          if (-not $boreExe) { Write-Host "❌ Không thấy bore.exe" -ForegroundColor Red; exit 1 }
+
+          Write-Host "🚀 Đang mở tunnel tới bore.pub..." -ForegroundColor Yellow
+          $logFile = "$env:TEMP\bore.log"
+          Remove-Item $logFile -ErrorAction SilentlyContinue
+          # Chạy nền, ghi log để lấy port được cấp
+          Start-Process -FilePath $boreExe -ArgumentList "local 3389 --to bore.pub" -RedirectStandardOutput $logFile -RedirectStandardError "$env:TEMP\bore.err" -WindowStyle Hidden
+
+          # Chờ và parse cổng công khai từ log (dạng: listening at bore.pub:XXXXX)
+          $borePort = $null
+          $tries = 0
+          while (-not $borePort -and $tries -lt 30) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $logFile) {
+              $content = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+              $m = [regex]::Match($content, 'bore\.pub:(\d+)')
+              if ($m.Success) { $borePort = $m.Groups[1].Value }
+            }
+            $tries++
+          }
+
+          if (-not $borePort) {
+            Write-Host "❌ Không lấy được cổng từ bore. Log:" -ForegroundColor Red
+            Get-Content $logFile -ErrorAction SilentlyContinue
+            Get-Content "$env:TEMP\bore.err" -ErrorAction SilentlyContinue
             exit 1
           }
 
-          Write-Host "🔧 Đang cài service..." -ForegroundColor Yellow
-          Set-Location $installDir
-          $svc = Get-Service -Name "Rustdesk" -ErrorAction SilentlyContinue
-          if (-not $svc) {
-            Start-Process ".\rustdesk.exe" -ArgumentList "--install-service" -Wait
-            Start-Sleep -Seconds 15
-            $svc = Get-Service -Name "Rustdesk" -ErrorAction SilentlyContinue
-          }
-
-          $waitCount = 0
-          while ($svc -and $svc.Status -ne 'Running' -and $waitCount -lt 12) {
-            Start-Service "Rustdesk" -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
-            $svc.Refresh()
-            $waitCount++
-          }
-          Write-Host "🔧 Service status: $($svc.Status)" -ForegroundColor Yellow
-
-          Write-Host "🆔 Đang lấy RustDesk ID..." -ForegroundColor Yellow
-          $rdId = $null
-          $idRetries = 0
-          while ([string]::IsNullOrWhiteSpace($rdId) -and $idRetries -lt 15) {
-            $rdId = (& ".\rustdesk.exe" --get-id 2>$null | Out-String).Trim()
-            if ([string]::IsNullOrWhiteSpace($rdId)) { Start-Sleep -Seconds 3 }
-            $idRetries++
-          }
-
-          if ([string]::IsNullOrWhiteSpace($rdId)) {
-            Write-Host "❌ Không lấy được ID sau nhiều lần thử" -ForegroundColor Red
-            Get-Service -Name "Rustdesk*" -ErrorAction SilentlyContinue | Format-List
-            exit 1
-          }
-
-          $matKhau = if ($env:CUSTOM_RDP_PASS) { $env:CUSTOM_RDP_PASS } else { New-PremiumPassword }
-          Write-Host "🔐 Đang đặt mật khẩu cố định..." -ForegroundColor Yellow
-          Start-Process ".\rustdesk.exe" -ArgumentList "--password $matKhau" -Wait
-          Start-Sleep -Seconds 2
-
-          echo "RUSTDESK_EXE=$rdExe" >> $env:GITHUB_ENV
-          echo "RUSTDESK_ID=$rdId" >> $env:GITHUB_ENV
-          echo "RUSTDESK_PASS=$matKhau" >> $env:GITHUB_ENV
-          Write-Host "✅ RustDesk đã sẵn sàng | ID: $rdId" -ForegroundColor Green
+          echo "BORE_HOST=bore.pub" >> $env:GITHUB_ENV
+          echo "BORE_PORT=$borePort" >> $env:GITHUB_ENV
+          Write-Host "✅ Tunnel sẵn sàng | bore.pub:$borePort" -ForegroundColor Green
 
       # HIỂN THỊ THÔNG TIN KẾT NỐI
       - name: 🎉 THÔNG TIN KẾT NỐI
         run: |
           $durationInput = "${{ github.event.inputs.duration }}"
           switch ($durationInput) {
-            "3h" { $totalMinutes = 180; $displayTime = "1 giờ" }
-            "5h" { $totalMinutes = 300; $displayTime = "3 giờ" }
+            "3h"    { $totalMinutes = 180; $displayTime = "3 giờ" }
+            "5h"    { $totalMinutes = 300; $displayTime = "5 giờ" }
             "5h40m" { $totalMinutes = 340; $displayTime = "5 giờ 40 phút" }
           }
           $timeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time")
           $thoiGianKetThuc = [System.TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $timeZone).AddMinutes($totalMinutes)
           Write-Host ""
           Write-Host "┌───────────────────────────────────────────┐" -ForegroundColor Cyan
-          Write-Host "│        🎉 RUSTDESK SẴN SÀNG!         │" -ForegroundColor Cyan
+          Write-Host "│          🎉 RDP SẴN SÀNG!             │" -ForegroundColor Cyan
           Write-Host "├───────────────────────────────────────────┤" -ForegroundColor Cyan
-          Write-Output "│ 🆔  RustDesk ID: $env:RUSTDESK_ID"
-          Write-Output "│ 🔐  Mật khẩu: $env:RUSTDESK_PASS"
+          Write-Output "│ 🌐  Địa chỉ: ${env:BORE_HOST}:${env:BORE_PORT}"
+          Write-Output "│ 👤  Tài khoản: $env:RDP_USER"
+          Write-Output "│ 🔐  Mật khẩu: $env:RDP_PASS"
           Write-Output "│ ⏰  Thời lượng: $displayTime"
           Write-Output "│ 🕐  Kết thúc: $($thoiGianKetThuc.ToString('HH:mm:ss'))"
           Write-Host "├───────────────────────────────────────────┤" -ForegroundColor Cyan
           Write-Output "│ 💡 Cách kết nối:"
-          Write-Output "│   1. Mở app RustDesk (PC/điện thoại)"
-          Write-Output "│   2. Nhập ID ở trên vào ô 'ID đối tác'"
-          Write-Output "│   3. Bấm Connect, nhập mật khẩu khi được hỏi"
+          Write-Output "│   1. Mở Remote Desktop (mstsc trên Windows)"
+          Write-Output "│   2. Computer: ${env:BORE_HOST}:${env:BORE_PORT}"
+          Write-Output "│   3. User + Password như trên"
           Write-Host "└───────────────────────────────────────────┘" -ForegroundColor Cyan
           echo "TOTAL_MINUTES=$totalMinutes" >> $env:GITHUB_ENV
 
       # DUY TRÌ PHIÊN
       - name: ⏳ DUY TRÌ KẾT NỐI
         run: |
-          $totalMinutes = $env:TOTAL_MINUTES
+          $totalMinutes = [int]$env:TOTAL_MINUTES
           $timeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time")
           $endTime = [System.TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $timeZone).AddMinutes($totalMinutes)
           Write-Host "🔄 Đang duy trì phiên trong $totalMinutes phút..." -ForegroundColor Yellow
@@ -147,8 +160,15 @@ jobs:
             $s = [math]::Floor($remaining.TotalSeconds % 60)
             $f = $frames[([int]((Get-Date)-$startTime).TotalSeconds) % $frames.Length]
             Write-Host "`r$f ⏳ Còn lại: $h giờ $m phút $s giây" -NoNewline -ForegroundColor Cyan
-            $svc = Get-Service -Name "Rustdesk" -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -ne 'Running') { Start-Service "Rustdesk" -ErrorAction SilentlyContinue }
+            # Giữ tunnel sống: nếu bore rớt thì bật lại
+            $bore = Get-Process -Name "bore" -ErrorAction SilentlyContinue
+            if (-not $bore) {
+              Write-Host "`n⚠️  Tunnel bore rớt, đang bật lại..." -ForegroundColor Red
+              $boreExe = (Get-ChildItem -Path "$env:TEMP\bore" -Filter "bore.exe" -Recurse | Select-Object -First 1).FullName
+              if ($boreExe) {
+                Start-Process -FilePath $boreExe -ArgumentList "local 3389 --to bore.pub --port $env:BORE_PORT" -WindowStyle Hidden
+              }
+            }
             Start-Sleep -Seconds 5
           } while ($true)
           Write-Host "`n🎯 Hết thời gian" -ForegroundColor Red
@@ -158,7 +178,7 @@ jobs:
         if: always()
         run: |
           Write-Host "🧹 Đang dọn dẹp..." -ForegroundColor Yellow
-          Stop-Service "Rustdesk" -Force -ErrorAction SilentlyContinue
-          Stop-Process -Name "rustdesk" -Force -ErrorAction SilentlyContinue
-          Remove-Item "$env:TEMP\rustdesk.exe" -ErrorAction SilentlyContinue
+          Stop-Process -Name "bore" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:TEMP\bore.zip" -ErrorAction SilentlyContinue
+          Remove-Item "$env:TEMP\bore" -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "✅ Dọn dẹp hoàn tất" -ForegroundColor Green
